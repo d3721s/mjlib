@@ -36,13 +36,17 @@ class CommandManager::Impl {
         line_buffer_(reinterpret_cast<char*>(
                          pool->Allocate(options.max_line_length, 1))),
         arguments_(reinterpret_cast<char*>(
-                       pool->Allocate(options.max_line_length, 1))) {}
+                       pool->Allocate(options.max_line_length, 1))),
+        streambuf_data_(reinterpret_cast<char*>(
+                            pool->Allocate(options.max_line_length, 1))),
+        read_streambuf_({streambuf_data_, options.max_line_length}, 0) {}
 
   void MaybeStartRead() {
     if (write_outstanding_) { return; }
 
     read_until_context_.stream = read_stream_;
-    read_until_context_.buffer =
+    read_until_context_.streambuf = &read_streambuf_;
+    read_until_context_.result =
         base::string_span(line_buffer_, options_.max_line_length);
     read_until_context_.delimiters = "\r\n";
     read_until_context_.callback =
@@ -61,7 +65,8 @@ class CommandManager::Impl {
       // TODO jpieper: Once we have an error system, log this error.
 
       read_until_context_.stream = read_stream_;
-      read_until_context_.buffer =
+      read_until_context_.streambuf = &read_streambuf_;
+      read_until_context_.result =
           base::string_span(line_buffer_, options_.max_line_length);
       read_until_context_.delimiters = "\r\n";
       read_until_context_.callback = [this](error_code, int) {
@@ -156,12 +161,15 @@ class CommandManager::Impl {
 
   char* const line_buffer_;
   char* const arguments_;
+  char* const streambuf_data_;
 
   base::string_span group_arguments_;
   CommandFunction current_command_;
   VoidCallback done_callback_;
 
   AsyncReadUntilContext read_until_context_;
+
+  AsyncStreamBuf read_streambuf_;
 };
 
 CommandManager::CommandManager(

@@ -16,35 +16,12 @@
 
 #include <boost/test/auto_unit_test.hpp>
 
+#include "mjlib/micro/test/async_stream_helper.h"
+
 using namespace mjlib::micro;
 namespace base = mjlib::base;
 
-namespace {
-class DutStream : public AsyncStream {
- public:
-  void AsyncReadSome(const base::string_span& data,
-                     const SizeCallback& cbk) override {
-    read_data_ = data;
-    read_cbk_ = cbk;
-    read_count_++;
-  }
-
-  void AsyncWriteSome(const std::string_view& data,
-                      const SizeCallback& cbk) override {
-    write_data_ = data;
-    write_cbk_ = cbk;
-    write_count_++;
-  }
-
-  base::string_span read_data_;
-  SizeCallback read_cbk_;
-  int read_count_ = 0;
-
-  std::string_view write_data_;
-  SizeCallback write_cbk_;
-  int write_count_ = 0;
-};
-}
+using mjlib::micro::test::DutStream;
 
 BOOST_AUTO_TEST_CASE(BasicAsyncStream) {
   DutStream dut_stream;

@@ -237,6 +237,7 @@ cc_library(
         "test/persistent_config_fixture.h",
         "test/reader.h",
         "test/str.h",
+        "test/async_stream_helper.h",
     ],
     deps = [
         ":event_queue",
@@ -282,6 +283,7 @@ cc_test(
     ] + select({
         "@bazel_tools//src/conditions:windows" : [],
         "//conditions:default" : [
+            "test/async_read_test.cc",
             "test/async_stream_test.cc",
             "test/command_manager_test.cc",
             "test/persistent_config_test.cc",

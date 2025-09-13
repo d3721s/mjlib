@@ -1,4 +1,4 @@
-// Copyright 2023 mjbots Robotic Systems, LLC.  info@mjbots.com
+// Copyright 2025 mjbots Robotic Systems, LLC.  info@mjbots.com
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,66 +27,137 @@
 namespace mjlib {
 namespace micro {
 
+struct AsyncStreamBuf {
+  // The available capacity in the streambuf.
+  base::string_span buffer;
+
+  // Data is filled up to this point.
+  size_t size = 0;
+
+  AsyncStreamBuf() {}
+  AsyncStreamBuf(base::string_span buffer_in, size_t size_in)
+      : buffer(buffer_in),
+        size(size_in) {}
+};
+
 struct AsyncReadUntilContext {
   AsyncReadStream* stream = nullptr;
-  base::string_span buffer;
+  AsyncStreamBuf* streambuf = nullptr;
+  base::string_span result;
+
   SizeCallback callback;
   const char* delimiters = nullptr;
 };
 
 namespace detail {
-inline void AsyncReadUntilHelper(AsyncReadUntilContext& context,
-                                 uint16_t position) {
+inline bool AsyncReadUntilCheck(AsyncReadUntilContext* ctx) {
+  auto* const sbd = ctx->streambuf->buffer.data();
+
+  for (uint16_t i = 0; i < ctx->streambuf->size; i++) {
+    if (std::strchr(ctx->delimiters, sbd[i]) != nullptr) {
+      // Copy to the result storage.
+      std::memcpy(ctx->result.data(), sbd, i + 1);
+      // Remove data from our streambuf.
+      const auto new_streambuf_size =
+          ctx->streambuf->size - i - 1;
+      std::memmove(sbd, sbd + i + 1, new_streambuf_size);
+      ctx->streambuf->size = new_streambuf_size;
+
+      ctx->callback({}, i + 1);
+      return true;
+    }
+  }
+
+  if (ctx->streambuf->size ==
+      static_cast<size_t>(ctx->streambuf->buffer.size())) {
+    const auto reply_size = ctx->streambuf->size;
+
+    // Empty the streambuf.
+    ctx->streambuf->size = 0;
+
+    // We overfilled our buffer without getting a terminator.
+    ctx->callback(errc::kDelimiterNotFound, reply_size);
+    return true;
+  }
+
+  return false;
+}
+
+inline void AsyncReadUntilHelper(AsyncReadUntilContext& context) {
+  if (AsyncReadUntilCheck(&context)) {
+    return;
+  }
+
   auto handler =
-      [ctx=&context,
-       position] (error_code error, std::size_t size) {
-    if (error) {
-      ctx->callback(error, position + size);
-      return;
-    }
+      [ctx=&context] (error_code error, std::size_t size) {
+        ctx->streambuf->size += size;
 
-    MJ_ASSERT(size == 0 || size == 1);
+        if (error) {
+          ctx->callback(error, ctx->streambuf->size);
+          return;
+        }
 
-    if (std::strchr(ctx->delimiters,
-                    ctx->buffer.data()[position]) != nullptr) {
-      ctx->callback({}, position + size);
-      return;
-    }
+        if (AsyncReadUntilCheck(ctx)) {
+          return;
+        }
 
-    if (position + 1 == static_cast<int>(ctx->buffer.size())) {
-      // We overfilled our buffer without getting a terminator.
-      ctx->callback(errc::kDelimiterNotFound, position);
-      return;
-    }
+        AsyncReadUntilHelper(*ctx);
+      };
 
-    AsyncReadUntilHelper(*ctx, position + 1);
-  };
-
+  // Attempt to read as much data as we have room for in our streambuf.
   context.stream->AsyncReadSome(
-      base::string_span(context.buffer.data() + position,
-                        context.buffer.data() + position + 1), handler);
+      base::string_span(
+          context.streambuf->buffer.data() +
+          context.streambuf->size,
+          context.streambuf->buffer.data() +
+          context.streambuf->buffer.size()), handler);
 }
 }
 
 inline void AsyncReadUntil(AsyncReadUntilContext& context) {
-  MJ_ASSERT(context.buffer.size() < std::numeric_limits<uint16_t>::max());
-  detail::AsyncReadUntilHelper(context, 0);
+  detail::AsyncReadUntilHelper(context);
+}
+
+namespace detail {
+bool AsyncIgnoreUntilCheck(AsyncReadUntilContext* ctx) {
+  // Is there a delimeter already in our streambuf?  If so, delete
+  // everything until then and return true.  If there isn't, then
+  // delete everything entirely in the streambuf and return false.
+  auto* const sbd = ctx->streambuf->buffer.data();
+
+  for (uint16_t i = 0; i < ctx->streambuf->size; i++) {
+    if (std::strchr(ctx->delimiters, sbd[i]) != nullptr) {
+      const auto new_streambuf_size =
+          ctx->streambuf->size - i - 1;
+      std::memmove(sbd, sbd + i + 1, new_streambuf_size);
+      ctx->streambuf->size = new_streambuf_size;
+      return true;
+    }
+  }
+
+  // No delimeters found.  Delete it all.
+  ctx->streambuf->size = 0;
+  return false;
+}
 }
 
 inline void AsyncIgnoreUntil(AsyncReadUntilContext& context) {
+  const auto done = detail::AsyncIgnoreUntilCheck(&context);
+  if (done) {
+    context.callback({}, 0);
+    return;
+  }
+
   context.stream->AsyncReadSome(
-      base::string_span(context.buffer.data(), context.buffer.data() + 1),
-      [ctx=&context](error_code error, std::size_t) {
+      base::string_span(context.streambuf->buffer.data(),
+                        context.streambuf->buffer.size()),
+      [ctx=&context](error_code error, std::size_t size) {
         if (error) {
           ctx->callback(error, 0);
           return;
         }
 
-        if (std::strchr(ctx->delimiters,
-                        ctx->buffer.data()[0]) != nullptr) {
-          ctx->callback({}, 0);
-          return;
-        }
+        ctx->streambuf->size += size;
 
         AsyncIgnoreUntil(*ctx);
       });
