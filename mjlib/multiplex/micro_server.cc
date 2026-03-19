@@ -111,6 +111,10 @@ class MicroServer::Impl {
 
     std::string_view write_buffer_;
     micro::SizeCallback write_callback_;
+
+    uint8_t flow_packet_number_ = 0;
+    bool flow_pending_ = false;
+    ssize_t flow_pending_size_ = 0;
   };
 
   Impl(micro::Pool* pool,
@@ -291,6 +295,17 @@ class MicroServer::Impl {
         continue;
       }
 
+      if (subframe_type == u8(Subframe::kClientPollServerFlow)) {
+        if (ProcessSubframeClientPollServerFlow(
+                buffer_stream, str,
+                response_buffer_stream,
+                response_stream)) {
+          stats_.malformed_subframe++;
+          return;
+        }
+        continue;
+      }
+
       if (subframe_type == u8(Subframe::kNop)) {
         continue;
       }
@@ -389,6 +404,8 @@ class MicroServer::Impl {
         response_stream->base()->write(tunnel.write_buffer_.substr(0, to_copy));
 
         tunnel.write_buffer_ = {};
+        tunnel.flow_pending_ = false;
+        tunnel.flow_pending_size_ = 0;
         auto cbk = tunnel.write_callback_;
         tunnel.write_callback_ = {};
         cbk({}, to_copy);
@@ -437,9 +454,92 @@ class MicroServer::Impl {
         response_stream->base()->write(tunnel.write_buffer_.substr(0, to_copy));
 
         tunnel.write_buffer_ = {};
+        tunnel.flow_pending_ = false;
+        tunnel.flow_pending_size_ = 0;
         auto cbk = tunnel.write_callback_;
         tunnel.write_callback_ = {};
         cbk({}, to_copy);
+      }
+    }
+
+    return false;
+  }
+
+  bool ProcessSubframeClientPollServerFlow(
+      base::BufferReadStream&,
+      BufferReadStream& str,
+      base::BufferWriteStream* response_buffer_stream,
+      BufferWriteStream* response_stream) {
+    const auto maybe_channel = str.ReadVaruint();
+    const auto maybe_packet_number = str.ReadScalar<uint8_t>();
+    const auto maybe_max_bytes = str.ReadVaruint();
+    if (!maybe_channel || !maybe_packet_number || !maybe_max_bytes) {
+      // Malformed.
+      return true;
+    }
+
+    auto maybe_tunnel = FindTunnel(*maybe_channel);
+    if (!maybe_tunnel) {
+      return true;
+    }
+
+    auto& tunnel = *maybe_tunnel;
+
+    if (response_stream) {
+      response_stream->WriteVaruint(
+          static_cast<uint8_t>(Subframe::kServerToClientFlow));
+      response_stream->WriteVaruint(*maybe_channel);
+
+      if (tunnel.flow_pending_ &&
+          *maybe_packet_number != tunnel.flow_packet_number_) {
+        // Previous response not acknowledged; retransmit from the
+        // still-held write_buffer_.
+        response_stream->Write(tunnel.flow_packet_number_);
+        response_stream->WriteVaruint(tunnel.flow_pending_size_);
+        if (tunnel.flow_pending_size_ > 0) {
+          response_stream->base()->write(
+              tunnel.write_buffer_.substr(0, tunnel.flow_pending_size_));
+        }
+      } else {
+        // Acknowledged (or no pending data).
+
+        if (tunnel.flow_pending_) {
+          // Release the previous write now that it has been acked.
+          const auto acked_size = tunnel.flow_pending_size_;
+          tunnel.flow_pending_ = false;
+          tunnel.flow_pending_size_ = 0;
+
+          tunnel.write_buffer_ = {};
+          if (tunnel.write_callback_) {
+            auto cbk = tunnel.write_callback_;
+            tunnel.write_callback_ = {};
+            cbk({}, acked_size);
+          }
+        }
+
+        // Send new data (if the application has provided any).
+        tunnel.flow_packet_number_++;
+        response_stream->Write(tunnel.flow_packet_number_);
+
+        const ssize_t kExtraPadding = 16;
+        const ssize_t kNeededOverhead =
+            kMaxVaruintSize + kCrcSize + kExtraPadding;
+        const auto to_copy =
+            std::min<std::streamsize>(
+                datagram_properties_.max_size - kNeededOverhead,
+                std::min<std::streamsize>(
+                    *maybe_max_bytes,
+                    std::min<std::streamsize>(
+                        tunnel.write_buffer_.size(),
+                        response_buffer_stream->remaining() - kNeededOverhead)));
+        response_stream->WriteVaruint(to_copy);
+
+        if (to_copy > 0) {
+          // Hold the buffer until acknowledged.
+          tunnel.flow_pending_ = true;
+          tunnel.flow_pending_size_ = to_copy;
+          response_stream->base()->write(tunnel.write_buffer_.substr(0, to_copy));
+        }
       }
     }
 

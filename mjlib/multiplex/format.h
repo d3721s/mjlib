@@ -115,6 +115,15 @@
 ///  0x42 - client poll server
 ///    - varuint => channel
 ///    - varuint => maximum number of bytes to reply
+///  0x43 - server data on channel w/ packet num
+///    - varuint => channel
+///    - uint8_t => packet number
+///    - varuint => number of bytes sent from server
+///    - N x uint8_t bytes
+///  0x44 - client poll server with ack
+///    - varuint => channel
+///    - uint8_t => packet_number
+///    - varuint => maximum number of bytes to reply
 ///
 /// In response to receiving a frame with the 0x40 subframe, the slave
 /// should respond with a 0x41 subframe whether or not it currently
@@ -123,6 +132,13 @@
 /// In response to receiving a 0x42 subframe, the slave should respond
 /// with an 0x41 subframe whether or not it has data, with a maximum
 /// size as specified by the client.
+///
+/// In response to receiving a 0x44 subframe, the slave should respond
+/// with a 0x43 subframe whether or not it has data.  If a previous
+/// response has not been acknowledged, reply with that regardless of
+/// the maximum size specified by the client.  If the previous
+/// response has been acknowledged, respond with new data up to the
+/// maximum size as specified by the client.
 ///
 /// A frame that contains a tunneled stream subframe may contain
 /// exactly 1 subframe total.
@@ -168,6 +184,8 @@ struct Format {
     kClientToServer = 0x40,
     kServerToClient = 0x41,
     kClientPollServer = 0x42,
+    kServerToClientFlow = 0x43,
+    kClientPollServerFlow = 0x44,
 
     kNop = 0x50,
   };

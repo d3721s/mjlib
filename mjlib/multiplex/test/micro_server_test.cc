@@ -837,3 +837,952 @@ BOOST_FIXTURE_TEST_CASE(DiscardTest, Fixture) {
   BOOST_TEST(std::string_view(receive_buffer, read_size) ==
              str(kExpectedResponse));
 }
+
+namespace {
+const uint8_t kClientToServerPollFlow[] = {
+  0x54, 0xab,  // header
+  0x82,  // source id
+  0x01,  // destination id
+  0x04,  // payload size
+    0x44,  // client poll server with ack
+      0x09,  // channel 9
+      0x00,  // packet_number 0
+      0x05,  // max bytes
+  0x19, 0xb5,  // CRC
+  0x00,  // null terminator
+};
+
+const uint8_t kClientToServerPollFlowAck1[] = {
+  0x54, 0xab,  // header
+  0x82,  // source id
+  0x01,  // destination id
+  0x04,  // payload size
+    0x44,  // client poll server with ack
+      0x09,  // channel 9
+      0x01,  // packet_number 1
+      0x05,  // max bytes
+  0x28, 0x86,  // CRC
+  0x00,  // null terminator
+};
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowControlPollTest, Fixture) {
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  Poll();
+  BOOST_TEST(write_count == 0);
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  Poll();
+  BOOST_TEST(write_count == 0);
+  BOOST_TEST(read_count == 0);
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  // The write callback is NOT invoked yet; buffer is held until ack.
+  BOOST_TEST(write_count == 0);
+  BOOST_TEST(read_count == 1);
+
+  const uint8_t kExpectedResponse[] = {
+    0x54, 0xab,
+    0x01,  // source id
+    0x02,  // dest id
+    0x09,  // payload size
+     0x43,  // server->client flow
+      0x09,  // channel 9
+      0x01,  // packet_number
+      0x05,  // 5 bytes of data
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,  // CRC
+    0x00,  // null terminator
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedResponse));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowControlRetransmitTest, Fixture) {
+  // First, send data and get initial response.
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  BOOST_TEST(read_count == 1);
+
+  // Now send another poll with packet_number=0 (wrong ack, server sent 1).
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  BOOST_TEST(read_count == 1);
+
+  // Should get same response retransmitted.
+  const uint8_t kExpectedRetransmit[] = {
+    0x54, 0xab,
+    0x01,  // source id
+    0x02,  // dest id
+    0x09,  // payload size
+     0x43,  // server->client flow
+      0x09,  // channel 9
+      0x01,  // packet_number (same as before)
+      0x05,  // 5 bytes of data
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,  // CRC
+    0x00,  // null terminator
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedRetransmit));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowControlAckTest, Fixture) {
+  // The first AsyncWriteSome callback provides new data synchronously,
+  // simulating an application that immediately queues more output.
+  int write_count1 = 0;
+  int write_count2 = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count1++;
+        // Immediately provide new data.
+        tunnel->AsyncWriteSome(
+            "more!and extra",
+            [&](micro::error_code ec2, ssize_t) {
+              BOOST_TEST(!ec2);
+              write_count2++;
+            });
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Initial poll: data sent but callback not yet invoked.
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  BOOST_TEST(write_count1 == 0);
+  BOOST_TEST(read_count == 1);
+
+  // Now ack with packet_number=1.  The first callback fires, which
+  // synchronously provides new data, and the server sends it.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlowAck1),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  BOOST_TEST(write_count1 == 1);
+  BOOST_TEST(read_count == 1);
+  // write_count2 is 0 because the new buffer is held until its ack.
+  BOOST_TEST(write_count2 == 0);
+
+  // Should get new data with incremented packet number.
+  const uint8_t kExpectedNewData[] = {
+    0x54, 0xab,
+    0x01,  // source id
+    0x02,  // dest id
+    0x09,  // payload size
+     0x43,  // server->client flow
+      0x09,  // channel 9
+      0x02,  // packet_number (incremented)
+      0x05,  // 5 bytes of data
+      'm', 'o', 'r', 'e', '!',
+    0x60, 0xa8,  // CRC
+    0x00,  // null terminator
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedNewData));
+}
+
+// ---- Adversarial flow control tests ----
+
+namespace {
+// Truncated: only subframe type, no channel/packet_number/max_bytes
+const uint8_t kFlowPollTruncJustType[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x01,        // payload size = 1
+    0x44,
+  0xaf, 0x82,  // CRC
+  0x00,
+};
+
+// Truncated: subframe type + channel, no packet_number or max_bytes
+const uint8_t kFlowPollTruncNoPacketNum[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x02,        // payload size = 2
+    0x44,
+    0x09,      // channel 9
+  0xb3, 0xd6,  // CRC
+  0x00,
+};
+
+// Truncated: type + channel + packet_number, no max_bytes
+const uint8_t kFlowPollTruncNoMaxBytes[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x03,        // payload size = 3
+    0x44,
+    0x09,      // channel 9
+    0x00,      // packet_number
+  0x0f, 0x6e,  // CRC
+  0x00,
+};
+
+// Flow poll on channel 7 (no tunnel allocated for it)
+const uint8_t kFlowPollBadChannel[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x04,
+    0x44,
+    0x07,      // channel 7 (nonexistent)
+    0x00,
+    0x05,
+  0x18, 0xae,  // CRC
+  0x00,
+};
+
+// Flow poll with max_bytes = 0
+const uint8_t kFlowPollZeroMax[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x04,
+    0x44,
+    0x09,      // channel 9
+    0x00,      // packet_number 0
+    0x00,      // max_bytes = 0
+  0xbc, 0xe5,  // CRC
+  0x00,
+};
+
+// Flow poll from source without response-request bit
+const uint8_t kFlowPollNoResponse[] = {
+  0x54, 0xab,
+  0x02, 0x01,  // source = 0x02 (no response bit)
+  0x04,
+    0x44,
+    0x09,
+    0x00,
+    0x05,
+  0xe0, 0x1e,  // CRC
+  0x00,
+};
+
+// Flow poll ack with packet_number=255 (wildly wrong)
+const uint8_t kFlowPollAck255[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x04,
+    0x44,
+    0x09,
+    0xff,      // packet_number = 255
+    0x05,
+  0xe6, 0xb6,  // CRC
+  0x00,
+};
+
+// Flow poll ack=1 with max_bytes=0
+const uint8_t kFlowPollAck1Max0[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x04,
+    0x44,
+    0x09,
+    0x01,      // packet_number = 1
+    0x00,      // max_bytes = 0
+  0x8d, 0xd6,  // CRC
+  0x00,
+};
+
+// Combined: write subframe + flow poll in same frame
+const uint8_t kWriteThenFlowPoll[] = {
+  0x54, 0xab,
+  0x82, 0x01,
+  0x07,        // payload size
+    0x01,      // write single int8
+    0x00,      // register 0
+    0x00,      // value 0
+    0x44,      // flow poll
+    0x09,      // channel 9
+    0x00,      // packet_number 0
+    0x05,      // max bytes 5
+  0x24, 0x5e,  // CRC
+  0x00,
+};
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollTruncatedTest, Fixture) {
+  // Each truncated frame should increment malformed_subframe.
+  const auto initial_malformed = dut.stats()->malformed_subframe;
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollTruncJustType),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(dut.stats()->malformed_subframe == initial_malformed + 1);
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollTruncNoPacketNum),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(dut.stats()->malformed_subframe == initial_malformed + 2);
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollTruncNoMaxBytes),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(dut.stats()->malformed_subframe == initial_malformed + 3);
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollBadChannelTest, Fixture) {
+  const auto initial_malformed = dut.stats()->malformed_subframe;
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollBadChannel),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(dut.stats()->malformed_subframe == initial_malformed + 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollNoDataTest, Fixture) {
+  // Poll with flow control when no data has been queued by the app.
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  // Response should have packet_number=1 and 0 bytes of data.
+  const uint8_t kExpectedEmpty[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x04,        // payload size
+     0x43,
+      0x09,      // channel 9
+      0x01,      // packet_number
+      0x00,      // 0 bytes
+    0x3b, 0x3a,  // CRC
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedEmpty));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollZeroMaxBytesTest, Fixture) {
+  // Queue data, but client requests max_bytes=0.
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollZeroMax),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+  BOOST_TEST(read_count == 1);
+  // Write callback not invoked: zero bytes were sent.
+  BOOST_TEST(write_count == 0);
+
+  // Response should have packet_number=1 and 0 bytes.
+  const uint8_t kExpectedZero[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x04,
+     0x43,
+      0x09,
+      0x01,      // packet_number
+      0x00,      // 0 bytes
+    0x3b, 0x3a,  // CRC
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedZero));
+
+  // Now poll again with proper max_bytes — data should still be available.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Ack packet 1 (which had 0 bytes, so nothing to retransmit).
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlowAck1),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 0);
+
+  // Should get data now with packet_number=2.
+  const uint8_t kExpectedData[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x09,        // payload size
+     0x43,
+      0x09,
+      0x02,      // packet_number 2
+      0x05,      // 5 bytes
+      's', 't', 'u', 'f', 'f',
+    0xca, 0x8e,  // CRC
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedData));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollNoResponseRequestedTest, Fixture) {
+  // Send a flow poll from a source that does not request a response.
+  // Flow state should not be affected.
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollNoResponse),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+
+  // No response was generated (source bit 7 not set).  Now send a real
+  // flow poll with response requested — should behave as if the first
+  // poll never happened.
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  // Normal response expected: packet_number=1, 5 bytes "stuff"
+  const uint8_t kExpected[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x09,
+     0x43,
+      0x09,
+      0x01,
+      0x05,
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpected));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollWildAckWhilePendingTest, Fixture) {
+  // Queue data, send initial flow poll, then send a poll with a wildly
+  // wrong packet_number (255).  Server should retransmit.
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Initial poll: server sends data with pkt=1.
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  // Now send poll with packet_number=255 (wildly wrong).
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollAck255),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  // Should retransmit the same data.
+  const uint8_t kExpectedRetransmit[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x09,
+     0x43,
+      0x09,
+      0x01,      // same packet_number
+      0x05,
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedRetransmit));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollAckThenZeroMaxTest, Fixture) {
+  // Queue data, get initial response, ack it with max_bytes=0.
+  // Verify the ack releases old data but no new data is sent.
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Initial poll.
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 0);
+
+  // Ack with packet_number=1 but max_bytes=0.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kFlowPollAck1Max0),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  // Ack should have released the write callback.
+  BOOST_TEST(write_count == 1);
+
+  // Response: packet_number=2, 0 bytes (max was 0).
+  const uint8_t kExpectedAckZero[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x04,
+     0x43,
+      0x09,
+      0x02,      // packet_number
+      0x00,      // 0 bytes
+    0x68, 0x6f,  // CRC
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedAckZero));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollMixWithOldPollTest, Fixture) {
+  // Mixing old-style 0x42 polls with 0x44 flow polls on the same
+  // channel.  The old poll consumes the buffer and resets flow state
+  // so the server remains internally consistent.
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Step 1: Flow poll — data sent but held until ack.
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 0);  // Buffer held.
+
+  // Step 2: Old-style 0x42 poll on the same channel.  It consumes
+  // the write buffer, fires the callback, and resets flow state.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPoll),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 1);
+
+  const uint8_t kExpectedOldResponse[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x08,
+     0x41,       // kServerToClient (old style)
+      0x09,
+      0x05,
+      's', 't', 'u', 'f', 'f',
+    0xc5, 0xa8,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedOldResponse));
+
+  // Step 3: Subsequent flow poll.  flow_pending_ was reset by the
+  // old poll, so the server treats this as a fresh request with no
+  // data available.  Packet number still advances.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  // Clean response: packet_number=2, 0 bytes (no data pending).
+  const uint8_t kExpectedClean[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x04,
+     0x43,
+      0x09,
+      0x02,      // packet_number advanced
+      0x00,      // 0 bytes — no data
+    0x68, 0x6f,  // CRC
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedClean));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollWriteSubframeComboTest, Fixture) {
+  // Frame containing a register write subframe followed by a flow poll.
+  // Both should be processed correctly.
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kWriteThenFlowPoll),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+
+  // Register write should have been processed.
+  BOOST_TEST(server.writes_.size() == 1);
+  BOOST_TEST(server.writes_.at(0).reg == 0);
+
+  BOOST_TEST(read_count == 1);
+  // Buffer held until ack.
+  BOOST_TEST(write_count == 0);
+
+  // Response should contain the flow data (write had no error).
+  const uint8_t kExpectedCombo[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x09,
+     0x43,
+      0x09,
+      0x01,
+      0x05,
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedCombo));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollMultipleRetransmitsTest, Fixture) {
+  // Verify that the server retransmits the same data repeatedly when
+  // the client keeps sending the wrong packet_number.
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+      });
+
+  char receive_buffer[256] = {};
+  auto do_poll = [&](const uint8_t* frame_data, size_t frame_size) {
+    int read_count = 0;
+    ssize_t read_size = 0;
+    dut_stream.side_a()->AsyncReadSome(
+        receive_buffer, [&](micro::error_code ec, ssize_t size) {
+          BOOST_TEST(!ec);
+          read_count++;
+          read_size = size;
+        });
+
+    AsyncWrite(*dut_stream.side_a(),
+               std::string_view(reinterpret_cast<const char*>(frame_data),
+                                frame_size),
+               [](micro::error_code ec) { BOOST_TEST(!ec); });
+    Poll();
+    BOOST_TEST(read_count == 1);
+    return read_size;
+  };
+
+  const uint8_t kExpectedData[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x09,
+     0x43, 0x09, 0x01, 0x05,
+      's', 't', 'u', 'f', 'f',
+    0x48, 0x56,
+    0x00,
+  };
+
+  // Initial poll.
+  auto sz = do_poll(kClientToServerPollFlow, sizeof(kClientToServerPollFlow));
+  BOOST_TEST(std::string_view(receive_buffer, sz) == str(kExpectedData));
+
+  // Retransmit 1 (wrong ack: 0).
+  sz = do_poll(kClientToServerPollFlow, sizeof(kClientToServerPollFlow));
+  BOOST_TEST(std::string_view(receive_buffer, sz) == str(kExpectedData));
+
+  // Retransmit 2 (wild ack: 255).
+  sz = do_poll(kFlowPollAck255, sizeof(kFlowPollAck255));
+  BOOST_TEST(std::string_view(receive_buffer, sz) == str(kExpectedData));
+
+  // Retransmit 3 (wrong ack: 0 again).
+  sz = do_poll(kClientToServerPollFlow, sizeof(kClientToServerPollFlow));
+  BOOST_TEST(std::string_view(receive_buffer, sz) == str(kExpectedData));
+}
+
+BOOST_FIXTURE_TEST_CASE(FlowPollMixClientToServerDataTest, Fixture) {
+  // Send 0x40 (client-to-server data with response) while flow data
+  // is pending.  The 0x40 handler consumes the buffer and resets flow
+  // state so the server remains consistent.
+  int write_count = 0;
+  tunnel->AsyncWriteSome(
+      "stuff to test",
+      [&](micro::error_code ec, ssize_t) {
+        BOOST_TEST(!ec);
+        write_count++;
+      });
+
+  char receive_buffer[256] = {};
+  int read_count = 0;
+  ssize_t read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  // Flow poll — holds data.
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 0);
+
+  // Now send 0x40 with empty data on same channel.  The 0x40 handler
+  // consumes write_buffer_, resets flow state, and fires the callback.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerEmpty),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(write_count == 1);
+
+  // 0x40 response sent all 13 bytes via 0x41.
+  const uint8_t kExpected40Response[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x10,        // payload size
+     0x41,
+      0x09,
+      0x0d,      // 13 bytes
+      's', 't', 'u', 'f', 'f', ' ', 't', 'o', ' ', 't', 'e', 's', 't',
+    0x9d, 0xd2,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpected40Response));
+
+  // Subsequent flow poll: flow state was reset, so server sends a
+  // clean empty response with advanced packet number.
+  read_count = 0;
+  read_size = 0;
+  dut_stream.side_a()->AsyncReadSome(
+      receive_buffer, [&](micro::error_code ec, ssize_t size) {
+        BOOST_TEST(!ec);
+        read_count++;
+        read_size = size;
+      });
+
+  AsyncWrite(*dut_stream.side_a(), str(kClientToServerPollFlow),
+             [](micro::error_code ec) { BOOST_TEST(!ec); });
+  Poll();
+  BOOST_TEST(read_count == 1);
+
+  const uint8_t kExpectedClean[] = {
+    0x54, 0xab,
+    0x01, 0x02,
+    0x04,
+     0x43,
+      0x09,
+      0x02,      // packet_number advanced
+      0x00,      // 0 bytes
+    0x68, 0x6f,
+    0x00,
+  };
+
+  BOOST_TEST(std::string_view(receive_buffer, read_size) ==
+             str(kExpectedClean));
+}
