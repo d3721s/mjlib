@@ -49,6 +49,8 @@ struct MyStruct {
   uint64_t u64_value = std::numeric_limits<uint64_t>::max();
   std::optional<int32_t> optional_unset_int;
   std::optional<int32_t> optional_set_int = 4;
+  float small_float_value = -1.42e-6f;
+  double small_double_value = 3.5e-9;
 
   template <typename Archive>
   void Serialize(Archive* a) {
@@ -63,6 +65,8 @@ struct MyStruct {
     a->Visit(MJ_NVP(u64_value));
     a->Visit(MJ_NVP(optional_unset_int));
     a->Visit(MJ_NVP(optional_set_int));
+    a->Visit(MJ_NVP(small_float_value));
+    a->Visit(MJ_NVP(small_double_value));
   }
 };
 }
@@ -76,7 +80,7 @@ BOOST_AUTO_TEST_CASE(BasicSerializableHandler) {
     char buffer[100] = {};
     base::BufferWriteStream write_stream{buffer};
     dut.WriteBinary(write_stream);
-    BOOST_TEST(write_stream.offset() == 59);
+    BOOST_TEST(write_stream.offset() == 71);
 
     my_struct.int_value = 20;
     BOOST_TEST(my_struct.int_value == 20);
@@ -90,7 +94,7 @@ BOOST_AUTO_TEST_CASE(BasicSerializableHandler) {
     char buffer[1000] = {};
     base::BufferWriteStream write_stream{buffer};
     dut.WriteSchema(write_stream);
-    BOOST_TEST(write_stream.offset() == 308);
+    BOOST_TEST(write_stream.offset() == 365);
   }
 
   {
@@ -157,7 +161,7 @@ BOOST_AUTO_TEST_CASE(BasicSerializableHandler) {
     event_queue.Poll();
     BOOST_TEST(complete_count == 2);
 
-    BOOST_TEST(reader.data_.str() == "7.000000");
+    BOOST_TEST(reader.data_.str() == "7");
   }
 
   {
@@ -208,6 +212,8 @@ BOOST_AUTO_TEST_CASE(BasicSerializableHandler) {
   test_read("u32_value", "10");
   test_read("optional_unset_int", "");
   test_read("optional_set_int", "4");
+  test_read("small_float_value", "-1.42e-06");
+  test_read("small_double_value", "3.5e-09");
 }
 
 BOOST_AUTO_TEST_CASE(EnumerateTest) {
@@ -240,12 +246,12 @@ BOOST_AUTO_TEST_CASE(EnumerateTest) {
   BOOST_TEST(done_ec == error_code());
   const std::string expected =
       "prefix.int_value 10\r\n"
-      "prefix.float_value 2.000000\r\n"
+      "prefix.float_value 2\r\n"
       "prefix.bool_value 0\r\n"
       "prefix.sub_value.detailed 23\r\n"
-      "prefix.array_value.0 6.000000\r\n"
-      "prefix.array_value.1 7.000000\r\n"
-      "prefix.array_value.2 8.000000\r\n"
+      "prefix.array_value.0 6\r\n"
+      "prefix.array_value.1 7\r\n"
+      "prefix.array_value.2 8\r\n"
       "prefix.array_struct.0.detailed 23\r\n"
       "prefix.array_struct.1.detailed 23\r\n"
       "prefix.u32_value 10\r\n"
@@ -253,6 +259,8 @@ BOOST_AUTO_TEST_CASE(EnumerateTest) {
       "prefix.u64_value 18446744073709551615\r\n"
       "prefix.optional_unset_int \r\n"
       "prefix.optional_set_int 4\r\n"
+      "prefix.small_float_value -1.42e-06\r\n"
+      "prefix.small_double_value 3.5e-09\r\n"
       ;
 
   BOOST_TEST(reader.data_.str() == expected);

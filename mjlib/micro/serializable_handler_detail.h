@@ -59,8 +59,8 @@ struct FormatSpecifier {
   static const char* GetFormat(uint32_t) { return "%" PRIu32; }
   static const char* GetFormat(uint64_t) { return "%" PRIu64; }
 
-  static const char* GetFormat(float) { return "%f"; }
-  static const char* GetFormat(double) { return "%f"; }
+  static const char* GetFormat(float) { return "%g"; }
+  static const char* GetFormat(double) { return "%g"; }
 
   static const char* GetFormat(Empty) { return ""; }
 };
@@ -424,7 +424,7 @@ struct ReadArchive : public ItemArchive<ReadArchive> {
 template <>
 inline std::string_view ReadArchive::EmitValue<float>(float value) {
   const int out_size = ::snprintf(
-      &*buffer_.begin(), buffer_.size(), "%f",
+      &*buffer_.begin(), buffer_.size(), "%g",
       static_cast<double>(value));
   return std::string_view(buffer_.begin(), out_size);
 }
