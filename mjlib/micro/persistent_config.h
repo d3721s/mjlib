@@ -54,6 +54,10 @@ class PersistentConfig {
   /// register their configurables.
   void Load();
 
+  /// Execute a configuration command.
+  void Command(const std::string_view& command,
+               const CommandManager::Response& response);
+
  private:
   /// This aliases Base, which must remain valid for the lifetime of
   /// the PersistentConfig.

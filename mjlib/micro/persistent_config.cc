@@ -494,6 +494,11 @@ void PersistentConfig::Load() {
   impl_->DoLoad();
 }
 
+void PersistentConfig::Command(const std::string_view& command,
+                               const CommandManager::Response& response) {
+  impl_->Command(command, response);
+}
+
 void PersistentConfig::RegisterDetail(
     const std::string_view& name, SerializableHandlerBase* base,
     base::inplace_function<void ()> updated,
